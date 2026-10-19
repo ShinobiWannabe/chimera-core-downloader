@@ -3,7 +3,9 @@
 Download the latest nightly release assets for every repo in the
 ToolAssisted-run GitHub org whose name starts with "chimera-core-".
 
-Files are saved into a "cores" folder next to this script.
+Files are saved into the same folder as this script (e.g. Chimera's Cores
+folder). The script also keeps two small bookkeeping files there:
+.manifest.json (hashes of downloaded cores) and .lock.
 Uses only the Python standard library (Python 3.8+).
 
 Usage:
@@ -58,7 +60,8 @@ ORG = "ToolAssisted-run"
 REPO_PREFIX = "chimera-core-"
 TAG_PREFIX = "nightly"          # matches tags like nightly-2026-10-13
 ASSET_SUFFIX = ".chimeraCore"   # set to "" to download every asset
-DEST_DIR = Path(__file__).resolve().parent / "cores"
+SCRIPT_PATH = Path(__file__).resolve()
+DEST_DIR = SCRIPT_PATH.parent   # save cores next to this script
 MAX_BYTES = 1 * 1024**3         # refuse assets larger than 1 GiB
 REQUIRE_DIGEST = True           # refuse assets GitHub has no SHA-256 for
 READ_TIMEOUT = 60               # seconds a single network read may stall
@@ -518,6 +521,10 @@ def process_repo(repo, manifest):
                       "integrity cannot be verified against GitHub")
 
         dest = DEST_DIR / name
+        if dest.resolve() == SCRIPT_PATH:  # only possible with ASSET_SUFFIX = ""
+            log(repo, f"{name} would overwrite this script, skipping")
+            failed += 1
+            continue
         if dest.is_file():
             # Compare against GitHub's digest if there is one, otherwise
             # against the hash we recorded when we downloaded it.
