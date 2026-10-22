@@ -13,6 +13,12 @@ Usage:
     python download_chimera_cores.py --wait     # wait for the reset and continue
     python download_chimera_cores.py --no-wait  # stop at the rate limit, never ask
 
+Each core's releases are read from the release index it publishes
+(releases.json on its `index` release) - the same file Chimera reads - so a
+run costs one GitHub API request (the list of repos) instead of one per core.
+A core without an index is looked up through the API; --api forces that for
+every core.
+
 If GitHub's API rate limit runs out mid-run, the script can wait until the
 limit resets and then carry on where it stopped. Run interactively without
 either option, it asks you; run unattended (e.g. as a scheduled task), it only
@@ -45,6 +51,7 @@ Safety measures:
 """
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -71,6 +78,11 @@ RESET_MARGIN = 5                # extra seconds to wait past the reset time
 
 API = "https://api.github.com"
 API_HOST = "api.github.com"
+# Every Chimera core publishes the list of its releases as a file on a
+# permanent `index` release; Chimera itself reads this instead of the API.
+INDEX_URL = "https://github.com/{org}/{repo}/releases/download/index/releases.json"
+MAX_INDEX_BYTES = 5 * 1024**2
+USE_API_ONLY = False            # set by --api
 # Hosts a redirect may lead to: the API itself (renamed repos), github.com,
 # and the two hosts GitHub serves release files from.
 ALLOWED_REDIRECT_HOSTS = {
@@ -335,8 +347,23 @@ def create_new(path, mode="wb", **kwargs):
 
 # ---------- single-instance lock ----------
 
+# Errors that mean "another process holds the lock", as opposed to "this
+# drive cannot lock files at all". Windows reports a held lock as EACCES or
+# EDEADLOCK; flock reports it as EWOULDBLOCK/EAGAIN.
+LOCK_BUSY_ERRNOS = {e for e in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK,
+                                getattr(errno, "EDEADLOCK", None),
+                                getattr(errno, "EDEADLK", None)) if e is not None}
+
+
+class LockBusy(Exception):
+    """Another copy of the script holds the lock for this folder."""
+
+
 def acquire_lock():
-    """Return an open lock handle, or None if another copy is running.
+    """Lock the folder against a second copy of the script. Returns the lock
+    handle, or None if this drive cannot lock files (the run then continues
+    without that protection). Raises LockBusy if another copy holds the lock,
+    and OSError if the lock file cannot be created at all.
     The OS releases the lock automatically if the process dies."""
     f = open(DEST_DIR / ".lock", "a+b")
     try:
@@ -347,8 +374,12 @@ def acquire_lock():
         else:
             import fcntl
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except OSError as e:
         f.close()
+        if e.errno in LOCK_BUSY_ERRNOS:
+            raise LockBusy() from e
+        print(f"warning: this drive does not support file locking ({describe(e)}); "
+              "continuing without protection against two copies running at once.")
         return None
     return f
 
@@ -356,6 +387,8 @@ def acquire_lock():
 def release_lock(f):
     """Unlock explicitly before closing: on Windows, a lock left to be cleaned
     up by close() may linger briefly and block an immediate re-run."""
+    if f is None:
+        return
     try:
         if os.name == "nt":
             import msvcrt
@@ -419,8 +452,56 @@ def list_repos():
     return sorted(names)
 
 
+def core_assets(release):
+    """The release's finished core files. An asset still being uploaded has a
+    state other than "uploaded" and cannot be downloaded yet."""
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        return []
+    return [a for a in assets if isinstance(a, dict)
+            and isinstance(a.get("name"), str) and a["name"].endswith(ASSET_SUFFIX)
+            and a.get("state", "uploaded") == "uploaded"]
+
+
+def fetch_index(repo):
+    """Download the core's release index (releases.json on its permanent
+    `index` release). It is a release file, so it does not count against the
+    API rate limit, and it has the same shape as the API's release list."""
+    url = INDEX_URL.format(org=ORG, repo=repo)
+    req = urllib.request.Request(url, headers={"User-Agent": "chimera-core-downloader"})
+    with OPENER.open(req, timeout=READ_TIMEOUT) as resp:
+        data = resp.read(MAX_INDEX_BYTES + 1)
+    if len(data) > MAX_INDEX_BYTES:
+        raise ValueError("release index is unreasonably large")
+    releases = json.loads(data.decode("utf-8"))
+    if not isinstance(releases, list):
+        raise ValueError("release index is not a list")
+    return releases
+
+
+def get_releases(repo):
+    """The repo's releases: from its index when it has one, otherwise from
+    the GitHub API (one rate-limited request)."""
+    if not USE_API_ONLY:
+        try:
+            return fetch_index(repo)
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            log(repo, "no release index; asking the GitHub API instead")
+        except ValueError as e:
+            log(repo, f"release index unusable ({describe(e)}); asking the GitHub API instead")
+    return api_get_list(f"{API}/repos/{ORG}/{repo}/releases?per_page=100")
+
+
 def latest_nightly(repo):
-    releases = api_get_list(f"{API}/repos/{ORG}/{repo}/releases?per_page=100")
+    """Return (release, passed_over): the newest nightly that holds a finished
+    core file, and the tags of newer nightlies that did not.
+
+    Chimera's publishing creates a nightly release first and uploads the core
+    into it afterwards, so for a while - or for good, if the upload failed -
+    the newest nightly can be empty. Then the previous nightly is used."""
+    releases = get_releases(repo)
     nightlies = [
         r for r in releases
         if isinstance(r, dict) and not r.get("draft")
@@ -428,10 +509,13 @@ def latest_nightly(repo):
         and r["tag_name"].lower().startswith(TAG_PREFIX)
         and isinstance(r.get("published_at") or r.get("created_at"), str)
     ]
-    if not nightlies:
-        return None
     nightlies.sort(key=lambda r: r.get("published_at") or r["created_at"], reverse=True)
-    return nightlies[0]
+    passed_over = []
+    for release in nightlies:
+        if core_assets(release):
+            return release, passed_over
+        passed_over.append(release["tag_name"])
+    return None, passed_over
 
 
 # ---------- download ----------
@@ -477,20 +561,20 @@ def process_repo(repo, manifest):
     """Handle one repo. Returns (downloaded, skipped, failed) counts."""
     downloaded = skipped = failed = 0
 
-    release = latest_nightly(repo)
+    release, passed_over = latest_nightly(repo)
     if release is None:
+        if passed_over:
+            log(repo, f"none of its {len(passed_over)} nightly release(s) has a finished "
+                      f"'{ASSET_SUFFIX}' file yet, skipping")
+            return 0, 0, 1
         log(repo, "no nightly release found, skipping")
         return 0, 0, 0
     tag = release["tag_name"]
+    if passed_over:
+        log(repo, f"newest nightly {passed_over[0]} has no finished core file yet "
+                  f"(still publishing, or its upload failed); using {tag}")
 
-    assets = release.get("assets")
-    if not isinstance(assets, list):
-        raise ValueError("release has no asset list")
-    assets = [a for a in assets if isinstance(a, dict)
-              and isinstance(a.get("name"), str) and a["name"].endswith(ASSET_SUFFIX)]
-    if not assets:
-        log(repo, f"{tag} has no '{ASSET_SUFFIX}' asset, skipping")
-        return 0, 0, 0
+    assets = core_assets(release)
 
     for asset in assets:
         name = safe_filename(asset["name"])
@@ -579,16 +663,30 @@ def parse_args(argv=None):
                              "and continue")
     choice.add_argument("--no-wait", dest="wait", action="store_false",
                         help="if GitHub's rate limit is hit, stop without asking")
+    parser.add_argument("--api", action="store_true",
+                        help="ask the GitHub API for every core's releases instead of "
+                             "reading each core's release index (uses far more of "
+                             "the API rate limit)")
     return parser.parse_args(argv)
 
 
 def main(argv=None):
+    global USE_API_ONLY
     args = parse_args(argv)
+    if args.api:
+        USE_API_ONLY = True
     make_output_safe()
     DEST_DIR.mkdir(exist_ok=True)
-    lock = acquire_lock()
-    if lock is None:
-        sys.exit("Another copy of this script is already running; exiting.")
+    try:
+        lock = acquire_lock()
+    except LockBusy:
+        sys.exit(f"Another copy of this script is already running in {DEST_DIR} - "
+                 "possibly one waiting for GitHub's rate limit to reset.\n"
+                 "Close it (press Ctrl+C in its window), then run this again.")
+    except OSError as e:
+        sys.exit(f"Cannot write to {DEST_DIR} ({describe(e)}).\n"
+                 "The script saves cores next to itself, so it must be in a folder "
+                 "you can write to.")
 
     try:
         remove_leftover_parts()
